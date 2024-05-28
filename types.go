@@ -156,3 +156,7 @@ type Person struct {
 func (p Person) GetName() string {
 	return p.Name
 }
+
+func (p Person) GetPeople() []string {
+	return []string{p.Name}
+}

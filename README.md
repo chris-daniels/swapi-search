@@ -3,7 +3,7 @@
 A quick integration with https://swapi.dev/api to search characters. 
 
 ### Requirements
-Go version 1.22.0. 
+ - Go version 1.22.0. 
 
 ### To run
 ```
@@ -16,35 +16,32 @@ $ go test .
 ```
 
 ### My approach
-From what I could see, SWAPI only allows pagination as query parameters to the API. So in the worst case, we need to search through all pages of all SWAPI endpoints. 
+SWAPI supports a search term on each entity type - planets, films, people, etc. So I didn't see any way around making a search call for each of these types. 
 
-I also assumed that the Star Wars canon is pretty static - a new Star Wars film likely won't come out during the lifetime of the CLI. 
+I decided to cache each of these SWAPI search calls for a given search term in-memory. I used a [caching library](https://github.com/patrickmn/go-cache) with a TTL of one hour. 
 
-The set of data working with here is pretty small, too. We can easily hold the names of characters/vehicles,films in-memory. 
+After fetching each entity, we're provided an array of people URLs. I just go and fetch those individually, surrounded by another cache. 
 
-So with all this in mind, I decided to simply crawl through all the pages of all of the SWAPI endpoints when the application starts and holding those values in-memory. The `searchTermCache` is a map of search terms to a set of character ids, and `peopleCache` maps those character ids to a `Person` pointer. There's some upfront cost to load all of this data, and it isn't resilient to SWAPI outages, but it seemed like a fair approach for this exercise. 
+This presents a problem, though. A broad enough search term will require us to go fetch every person in the system individually, which is very slow. To get around this, I make a series of paginated `/people` requests _at startup_ to get all people entries cached in memory. This takes a few seconds up front, but it improves the performance of search after that significantly. 
 
-### Roadmap
-My time was limited here so far, so I have a few items I'd like to try to get to. 
- - Improved testing
-   - We should mock the SWAPI API when we test the `FetchSwapiData` function. 
-   - We should test the API layer's `FetchEntities` function. 
- - I think it would be fun to try to do some fuzzy search here. 
+The project is pretty small, but it's roughly split as follows:
+ - `main.go` handles startup and reading user input
+ - `search.go` handles the logic of taking a search term, fanning that search term out to a bunch of requests, and building a text response to be surfaced to the user. 
+ - `swapi.go` handles making requests to the SWAPI API.
+
+
+ There are some basic tests in `main_test.go` that mock the SWAPI API. 
 
 
 ### Bringing this to production
 To bring this app to production, we would need to make a few changes. 
 
-We could distribute this CLI tool, and people could use it that way, but eventually we might want something prettier. Also, having every individual user wait around for 6-7 seconds while they fetch the whole SWAPI API's data on startup doesn't make a ton of sense. If we centralize some stuff here, we can get a much faster experience for most users. 
+We could distribute this CLI tool, and people could use it that way, but eventually we might want something prettier. Also, caching is done by each instance of the app here, which means the user will have to wait around for a few seconds at startup to populate the people cache. They'll also get pretty slow responses for every new query they do. For these reasons we might want to centralize some stuff.
 
 So to move forward, I'd imagine we would have a client/server model in place here. The server would handle fetching data from the SWAPI and providing a search API, and clients would then handle taking user input and making search requests. This could still be a CLI tool, but we could also consider building a web front-end. 
 
-I actually think my current approach, where Star Wars characters are held in memory, is pretty feasible in production. Whenever an instance of the service starts, we fetch the data, and every instance of the service can hold all this in memory. The scale of this data is small enough that the inpact on service startup time and memory consumed aren't too significant. 
+If we want to scale our server to handle many, many search requests, we'll want to scale horizontally. In this case, we probably want to share the cache among instances of this service. We might swap out our in-memory solution here for a fast key-value store that's shared. Maybe we could use a Redis instance here. 
 
-If we wanted to pull from a broader dataset, though, this approach would fall apart. Suppose we wanted to pull data from all movies in existence. This set of data could grow large enough that it becomes expensive to hold everything in-memory. Even if we can fit everything on one machine, it's redundant to hold duplicated data across every machine. It would also start to take a load time to fetch all relevant data. Then we might want to reconsider our architecture and add a persistence layer. This could be a relational database where relationships between entities are managed by the RDMS.
+One other thing I might consider for this use case is a different approach, where we periodically pull the entire SWAPI dataset (it's quite small and can easily fit in memory), and build out our own in-memory search index. The logic might be a little tricky, but I think we could set up some sort of tree structure that allows us to fuzzy search on all the entities in the database. There are only a few hundred entities in the Star Wars universe, and I think the dataset is pretty static, so fetching everything and building up this structure is something we could do periodically. The benefit we'd get here is that we'd never encounter a search query where we don't have the results pre-fetched. We wouldn't need to do slow calls to SWAPI synchronously.
 
-Entries in our database should have a TTL, so we can fetch updates hourly/daily, whatever we decide is appropriate. We could set up an async task that writes a new version of everything, and then we update a "version" variable to point to the updated records. This way we can refresh our data without any impact on response time. 
-
-With these changes, we'd have a super lightweight client that passes search terms along to the API. These requests are handled by machines that can be scaled horizontally, and these instances of our service will all share a persistence layer that has relatively up-to-date records. 
-
-The only final thing I'd consider is standing up a task that polls the SWAPI endpoint and looks for updates. We could get `count` values off the response to detect when new data becomes available.  Then we can time our refreshes to fetch data as soon as possible. 
+One unrelated performance change - right now the SWAPI calls are made in sequence. I think we could rework these to be made in parallel. This would give us performance improvement anywhere we do SWAPI search calls sequentially, regardless of the architecture. 
